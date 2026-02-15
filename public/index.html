@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>VOHALA WhatsApp Auto Video Downloader.</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>VOHALA WhatsApp Auto Video Downloader.</h1>
+      <div class="status">
+        Status: <span id="status" class="badge badge-disconnected">Disconnected</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel qr-panel">
+        <h2>QR Code</h2>
+        <div id="qr-wrapper">
+          <div id="qr-placeholder">Waiting for QR...</div>
+          <img id="qr-image" alt="WhatsApp QR" />
+        </div>
+      </section>
+
+      <section class="panel messages-panel">
+        <h2>Incoming Messages</h2>
+        <div id="messages"></div>
+      </section>
+
+      <section class="panel logs-panel">
+        <h2>Download Queue & Logs</h2>
+        <div class="queue-summary">
+          <span>Active jobs: <span id="queue-active">0</span></span>
+          <span>Queued jobs: <span id="queue-queued">0</span></span>
+        </div>
+        <div id="jobs"></div>
+        <div id="logs"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/dashboard.js"></script>
+</body>
+</html>
