@@ -1,3 +1,4 @@
+// public/dashboard.js
 (() => {
   const socket = io();
 
