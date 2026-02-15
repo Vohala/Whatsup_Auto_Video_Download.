@@ -1,0 +1,26 @@
+{
+  "name": "whatsapp-youtube-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Web automation with YouTube download",
+  "main": "server.js",
+  "scripts": {
+    "start": "NODE_ENV=production node server.js",
+    "dev": "NODE_ENV=development nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.5",
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode": "^1.5.3",
+    "uuid": "^9.0.1",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
