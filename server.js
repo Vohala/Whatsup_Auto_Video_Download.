@@ -1,10 +1,11 @@
+// server.js
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const express = require("express");
 const { Server } = require("socket.io");
 const qrcode = require("qrcode");
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const { Client, LocalAuth } = require("whatsapp-web.js");
 const { v4: uuidv4 } = require("uuid");
 const pino = require("pino");
 const { spawn } = require("child_process");
@@ -55,7 +56,7 @@ const client = new Client({
   }),
   puppeteer: {
     headless: true,
-    timeout: 180000,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -168,13 +169,19 @@ async function handleTriggerFlow(msg, content, chatId) {
 
   const state = currentModeByChat.get(chatId) || null;
 
+  // FIX 1: If already in flow and user sends trigger again, ignore
+  if (isTriggerStart && state) {
+    logger.info("User already in flow, ignoring duplicate trigger");
+    return;
+  }
+
   if (!isTriggerStart && !state) {
     return;
   }
 
   if (isTriggerStart && !state) {
     currentModeByChat.set(chatId, "awaiting_type");
-    await msg.reply("Welcome to Vohala World. What do you need? Video or Audio?");
+    await msg.reply("What do you need? Video or Audio?");
     return;
   }
 
@@ -211,13 +218,14 @@ async function handleTriggerFlow(msg, content, chatId) {
     const url = urlMatch[1];
     const mode = state === "awaiting_link_video" ? "video" : "audio";
 
-    currentModeByChat.set(chatId, null);
+    // FIX: Clear state immediately to prevent duplicate processing
+    currentModeByChat.delete(chatId);
 
     await enqueueDownloadJob({ msg, url, mode });
     return;
   }
 
-  currentModeByChat.set(chatId, null);
+  currentModeByChat.delete(chatId);
 }
 
 async function enqueueDownloadJob({ msg, url, mode }) {
@@ -251,93 +259,57 @@ async function handleDownloadJob(jobId, msg, url, mode) {
     broadcast("job-progress", { jobId, stage, percent, ...extra });
   };
 
-  const MAX_FILE_SIZE = 100 * 1024 * 1024;
-
   try {
     updateProgress("info", 0, { message: "Starting yt-dlp..." });
 
     const baseName = `${Date.now()}_${jobId}`;
-    const ext = mode === "video" ? "mp4" : "mp3";
     const outputTemplate = path.join(
       config.DOWNLOAD_DIR,
-      `${baseName}.${ext}`
+      `${baseName}.%(ext)s`
     );
 
+    // FIX 2: Use more flexible format selectors that work for all videos
     const args =
       mode === "video"
         ? [
             "-f",
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4][height<=720]/best[height<=720]",
+            "best[ext=mp4]/best",  // Try best mp4, fallback to any best format
             "--merge-output-format",
             "mp4",
             "--no-playlist",
-            "--max-filesize",
-            "100M",
             "-o",
             outputTemplate,
             url
           ]
         : [
             "-f",
-            "bestaudio",
+            "bestaudio/best",  // Try best audio, fallback to best overall
             "-x",
             "--audio-format",
             "mp3",
             "--no-playlist",
-            "--max-filesize",
-            "100M",
             "-o",
             outputTemplate,
             url
           ];
 
-    await runYtDlp(jobId, args, updateProgress);
+    const downloadInfo = await runYtDlp(jobId, args, updateProgress);
 
     let finalPath = null;
-
-    if (fs.existsSync(outputTemplate)) {
-      finalPath = outputTemplate;
+    if (downloadInfo && downloadInfo.filename) {
+      finalPath = downloadInfo.filename;
     } else {
       const files = fs
         .readdirSync(config.DOWNLOAD_DIR)
-        .filter(f => f.startsWith(baseName));
+        .filter(f => f.startsWith(baseName + "."));
       if (files.length > 0) {
         finalPath = path.join(config.DOWNLOAD_DIR, files[0]);
       }
     }
 
     if (!finalPath || !fs.existsSync(finalPath)) {
-      throw new Error("Downloaded file not found after yt-dlp completed");
+      throw new Error("Downloaded file not found");
     }
-
-    if (mode === "video") {
-      updateProgress("encode", 0, { message: "Re-encoding for WhatsApp compatibility..." });
-      
-      const reEncodedPath = finalPath.replace('.mp4', '_whatsapp.mp4');
-      
-      try {
-        await reEncodeForWhatsApp(finalPath, reEncodedPath, updateProgress);
-        fs.unlinkSync(finalPath);
-        finalPath = reEncodedPath;
-        updateProgress("encode", 100, { message: "Re-encoding complete" });
-      } catch (err) {
-        logger.warn({ err }, "Re-encoding failed, will try sending original");
-      }
-    }
-
-    const stats = fs.statSync(finalPath);
-    const sizeBytes = stats.size;
-    const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(2);
-
-    if (sizeBytes > MAX_FILE_SIZE) {
-      throw new Error(
-        `File too large: ${sizeMB} MB exceeds ${MAX_FILE_SIZE / (1024 * 1024)} MB limit. WhatsApp Web cannot reliably send files this large via browser.`
-      );
-    }
-
-    updateProgress("validate", 100, {
-      message: `File size OK: ${sizeMB} MB`
-    });
 
     await sendAndDelete(msg, finalPath, mode, updateProgress);
   } catch (err) {
@@ -354,6 +326,7 @@ async function handleDownloadJob(jobId, msg, url, mode) {
 
 function runYtDlp(jobId, args, progressCb) {
   return new Promise((resolve, reject) => {
+    let lastFilename = null;
     let stderrBuffer = "";
 
     const proc = spawn("yt-dlp", args);
@@ -367,6 +340,11 @@ function runYtDlp(jobId, args, progressCb) {
         const percent = Math.round(parseFloat(match[1]));
         progressCb("download", percent, { message: "Downloading..." });
       }
+
+      const fileMatch = text.match(/Destination:\s(.+)$/m);
+      if (fileMatch) {
+        lastFilename = fileMatch[1].trim();
+      }
     });
 
     proc.stderr.on("data", data => {
@@ -378,7 +356,7 @@ function runYtDlp(jobId, args, progressCb) {
     proc.on("close", code => {
       if (code === 0) {
         progressCb("download", 100, { message: "Download completed" });
-        resolve();
+        resolve({ filename: lastFilename });
       } else {
         const errMsg =
           stderrBuffer.split("\n").filter(Boolean).slice(-3).join(" | ") ||
@@ -393,139 +371,30 @@ function runYtDlp(jobId, args, progressCb) {
   });
 }
 
-function reEncodeForWhatsApp(inputPath, outputPath, progressCb) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-i', inputPath,
-      '-c:v', 'libx264',
-      '-profile:v', 'baseline',
-      '-level', '3.0',
-      '-c:a', 'aac',
-      '-strict', 'experimental',
-      '-movflags', '+faststart',
-      '-y',
-      outputPath
-    ];
-
-    const proc = spawn('ffmpeg', args);
-    let stderrBuffer = '';
-
-    proc.stderr.on('data', data => {
-      const text = data.toString();
-      stderrBuffer += text;
-      
-      const match = text.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-      if (match) {
-        const hours = parseInt(match[1]);
-        const minutes = parseInt(match[2]);
-        const seconds = parseFloat(match[3]);
-        const totalSeconds = hours * 3600 + minutes * 60 + seconds;
-        
-        progressCb("encode", Math.min(90, Math.floor(totalSeconds / 2)), {
-          message: `Re-encoding: ${Math.floor(totalSeconds)}s processed...`
-        });
-      }
-    });
-
-    proc.on('close', code => {
-      if (code === 0) {
-        resolve();
-      } else {
-        const errMsg = stderrBuffer.split('\n').filter(Boolean).slice(-3).join(' | ') ||
-          `ffmpeg exited with code ${code}`;
-        reject(new Error(errMsg));
-      }
-    });
-
-    proc.on('error', err => {
-      if (err.code === 'ENOENT') {
-        reject(new Error('ffmpeg not found - install ffmpeg to enable video re-encoding'));
-      } else {
-        reject(err);
-      }
-    });
-  });
-}
-
 async function sendAndDelete(msg, filePath, mode, progressCb) {
   const fileName = path.basename(filePath);
+  progressCb("send", 0, { message: `Sending ${fileName} via WhatsApp...` });
+
   const stats = fs.statSync(filePath);
   const sizeBytes = stats.size;
-  const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(2);
 
-  progressCb("send", 0, {
-    message: `Preparing to send ${fileName} (${sizeMB} MB)...`
+  const chat = await msg.getChat();
+  
+  // Send file as media with proper MIME type detection
+  const messageMedia = require("whatsapp-web.js").MessageMedia;
+  const media = messageMedia.fromFilePath(filePath);
+  
+  await chat.sendMessage(media, {
+    caption: fileName
   });
 
+  progressCb("send", 100, { message: `Sent ${fileName} (${sizeBytes} bytes)` });
+
   try {
-    const mimetype = mode === "video" ? "video/mp4" : "audio/mpeg";
-    const media = await MessageMedia.fromFilePath(filePath);
-    media.mimetype = mimetype;
-    media.filename = fileName;
-    
-    progressCb("send", 30, {
-      message: `Loaded ${fileName} into memory, uploading...`
-    });
-
-    const chat = await msg.getChat();
-    
-    const sendOptions = {
-      caption: `${fileName} (${sizeMB} MB)`,
-      sendMediaAsDocument: true
-    };
-
-    let lastError = null;
-    const MAX_RETRIES = 2;
-    
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        progressCb("send", 40 + (attempt - 1) * 20, {
-          message: `Sending to WhatsApp (attempt ${attempt}/${MAX_RETRIES})...`
-        });
-        
-        await chat.sendMessage(media, sendOptions);
-        
-        progressCb("send", 100, {
-          message: `Successfully sent ${fileName} (${sizeMB} MB)`
-        });
-        
-        lastError = null;
-        break;
-      } catch (err) {
-        lastError = err;
-        logger.warn(
-          { err, attempt, maxRetries: MAX_RETRIES },
-          `Send attempt ${attempt} failed`
-        );
-        
-        if (
-          err.message?.includes("Target closed") ||
-          err.message?.includes("Protocol error")
-        ) {
-          if (attempt < MAX_RETRIES) {
-            progressCb("send", 40 + (attempt - 1) * 20, {
-              message: `Browser error, retrying in 3s...`
-            });
-            await new Promise(resolve => setTimeout(resolve, 3000));
-          }
-        } else {
-          throw err;
-        }
-      }
-    }
-    
-    if (lastError) {
-      throw new Error(
-        `Failed to send after ${MAX_RETRIES} attempts: ${lastError.message}`
-      );
-    }
-  } finally {
-    try {
-      fs.unlinkSync(filePath);
-      progressCb("cleanup", 100, { message: "Temporary file deleted" });
-    } catch (err) {
-      logger.warn({ err }, "Failed to delete temp file");
-    }
+    fs.unlinkSync(filePath);
+    progressCb("cleanup", 100, { message: "Temporary file deleted" });
+  } catch (err) {
+    logger.warn({ err }, "Failed to delete temp file");
   }
 }
 
@@ -565,5 +434,32 @@ const HOST = process.env.HOST || "0.0.0.0";
 
 server.listen(PORT, HOST, () => {
   logger.info(`Server listening on http://${HOST}:${PORT}`);
+  
+  // Clean Chromium lock files from previous runs
+  const sessionsDir = path.join(__dirname, "sessions");
+  if (fs.existsSync(sessionsDir)) {
+    const cleanLockFiles = (dir) => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            cleanLockFiles(fullPath);
+          } else if (entry.name === "SingletonLock") {
+            try {
+              fs.unlinkSync(fullPath);
+              logger.info({ path: fullPath }, "Removed Chromium lock file");
+            } catch (err) {
+              logger.warn({ err, path: fullPath }, "Could not remove lock");
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, dir }, "Error scanning sessions directory");
+      }
+    };
+    cleanLockFiles(sessionsDir);
+  }
+  
   client.initialize();
 });
