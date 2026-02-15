@@ -1,0 +1,13 @@
+module.exports = {
+  
+  TRIGGER_NUMBER: "91NUMBER",
+
+  MAX_VIDEO_SIZE: 50 * 1024 * 1024, 
+  MAX_AUDIO_SIZE: 20 * 1024 * 1024, 
+
+  DOWNLOAD_DIR: "downloads",
+
+  MAX_CONCURRENT_JOBS: 2,
+
+  CORS_ORIGIN: "*"
+};
